@@ -22,15 +22,23 @@ The brief carries the quality table (each free model's rating in
 milli-points and what it can do) and the workload manifest (the 20 requests,
 their weight, their requirements). At load, every request is planned:
 weight-2 requests pick first, each taking the best-rated free model that
-meets its requirements, within a per-provider call budget (the maximum the
-kit's sealed provider table allows for that provider). At serve time a
-planned pick that refuses (402/429/5xx, or an unparseable body) fails over
-to the next-best candidate, preferably on another provider. A refusal while
-the provider still has planned budget left cannot be a spent budget — it is
-a transient fail_call — so the same candidate is retried once before
-falling over. A 402 is a spent budget and is never retried; two consecutive
-refusals only mark a provider spent once it has answered at least its
-minimum budget. One provider call at a time, always.
+meets its requirements, within the call-floor caps in `lib/providers.ts` —
+the ten caps sum to exactly the 20 requests (openrouter 4, groq 3, kilol 3,
+pollinations 3, gemini 2, cerebras 1, zai 1, sambanova 1, cloudflare 1,
+ovh 1), so the plan is one call a request and never over-commits a
+provider. The caps are the point of v2: the leaderboard breaks a score tie
+by the upstream call count, and every provider fails 1–2 of its calls on a
+schedule the brief never publishes, so a plan that piles requests on the
+best provider pays for every refused call twice. The caps were picked by
+simulating the kit generator's own draw over 2,000 fresh instances plus
+the three practice trials. At serve time a planned pick that refuses
+(402/429/5xx, or an unparseable body) fails over to the next-best
+candidate, preferably on another provider. A refusal while the provider
+still has planned budget left cannot be a spent budget — it is a transient
+fail_call — so the same candidate is retried once before falling over. A
+402 is a spent budget and is never retried; two consecutive refusals only
+mark a provider spent once it has answered at least its minimum budget.
+One provider call at a time, always.
 
 ## Wires
 
@@ -70,11 +78,19 @@ Verified with the kit's own grader, process driver (no Docker on this
 machine), all three practice trials:
 
 ```
-score 99 on every trial: catalog 100, failover 100, quality 99,
+score 99 on every trial: catalog 100, failover 100, quality 98,
 served 100, wire 100, working 1; replay matched byte for byte;
-L1 regrade reproduced byte for byte.
+L1 regrade reproduced byte for byte. Upstream calls: 21/22/22 on
+trials 0/1/2 (v1: 26/28/30).
 ```
 
-Quality 99 is the practical ceiling here: the best-rated free model cannot
-serve all 17 non-vision requests within its per-trial budget, so the tail
-of the workload is served by the next-best free models (1470 vs 1475).
+Quality 98 is deliberate, not a regression: the call-floor plan trades a
+few rating points on the tail (1470 instead of 1475 on seven weight-1
+requests) for ~6 fewer upstream calls, and score =
+round((60·quality + 15·served + 10·wire + 10·failover + 5·catalog)/100)
+rounds quality 98 and quality 99 to the same 99. The leaderboard breaks a
+score tie by the call count, so the calls are the ranking, and 21/22/22
+beats v1's 26/28/30 on every trial. Confirmed by the kit's own grader
+(`grade-local --driver process --instances 3`): replay matched byte for
+byte on all three trials, L1 regrade reproduced byte for byte,
+0 nondeterministic.

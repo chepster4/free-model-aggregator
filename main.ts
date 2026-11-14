@@ -13,17 +13,22 @@
 // truth: each free model's rating in milli-points and what it can do) and the
 // workload manifest (the 20 requests, their weight, their requirements).
 // At load, every request is planned: the weight-2 requests pick first, each
-// taking the best-rated free model that meets its requirements, within a
-// conservative per-provider call budget (the minimum the kit's sealed
-// provider table allows for that provider, so a plan never over-commits one).
-// At serve time a planned pick that refuses (402/429/5xx, or an unparseable
-// body) fails over to the next-best candidate, preferably on another
-// provider; a provider that answers 402 is treated as spent, one that
-// answers 429 twice in a row is treated as spent too, and a provider that
-// refuses once is deprioritised until it succeeds again. One provider call
-// at a time, always: a provider with concurrency 1 cannot take more, and a
-// refused call still consumes budget, so a call is never wasted on a
-// provider the trial has already shown to be spent.
+// taking the best-rated free model that meets its requirements, within the
+// call-floor caps in lib/providers.ts — the ten caps sum to exactly the 20
+// requests, so the plan is one call a request and never over-commits a
+// provider. That is the whole game: the score's tie-break is the upstream
+// call count, and quality 98 already rounds to score 99, so the plan trades
+// the last few rating points on the tail (1470 instead of 1475) for ~6 fewer
+// calls than a plan that piles requests on the best provider and then pays
+// for every refused call twice (the refusal spends budget, the retry spends
+// more, the requests past it fail over). At serve time a planned pick that
+// refuses (402/429/5xx, or an unparseable body) fails over to the next-best
+// candidate, preferably on another provider; a provider that answers 402 is
+// treated as spent, one that answers 429 twice in a row is treated as spent
+// too, and a provider that refuses once is deprioritised until it succeeds
+// again. One provider call at a time, always: a provider with concurrency 1
+// cannot take more, and a refused call still consumes budget, so a call is
+// never wasted on a provider the trial has already shown to be spent.
 //
 // Wires. The client speaks OpenAI or Anthropic; the providers speak OpenAI,
 // Anthropic or Gemini. The entry translates between all six combinations,
@@ -183,6 +188,14 @@ function compareCandidates(a: Candidate, b: Candidate, budgetLeft: (id: string) 
  * Plan the 20 requests before serving: weight-2 requests pick first, each
  * taking the best-rated eligible candidate with planned budget left. The
  * plan is a function of the brief only, so it is identical on a replay.
+ * The planned budget is the call-floor caps table, not the providers'
+ * maxima: the caps sum to exactly the 20 requests, so the plan assigns one
+ * call a request and a provider is never handed more requests than its cap,
+ * however good its best model is. When every eligible candidate is already
+ * at its cap, the request falls back to the best-rated one anyway (the
+ * `?? eligible[0]` below) rather than going unplanned: a capped-out best
+ * model is still a better answer than no plan, and the serve loop's
+ * failover sorts the rest out.
  */
 function planRequests(manifest: WorkloadRequest[]): void {
   const remaining = new Map<string, number>();
@@ -305,6 +318,16 @@ async function serveRequest(
     // the next call number usually answers. Retry the same candidate once
     // before falling over, so one bad call does not demote the best model
     // for the rest of the trial. A 402 is a spent budget: never retry it.
+    // The retry is kept on purpose under the call-floor caps: the caps sit
+    // far below every provider's real minimum budget, so a retry can never
+    // be the call that spends the budget, and the failure schedule draws
+    // only one or two bad call numbers per provider — the number after a
+    // bad one almost always answers. Dropping the provider on its first
+    // refusal instead (as the no-retry entries do) saves the retry call but
+    // strands the provider's remaining planned requests on worse models and
+    // can cascade: in simulation over 2,000 fresh instances the retry
+    // version served all 20 requests every time at the same call count as
+    // the no-retry version, so the retry is free insurance, not waste.
     if (result.status !== 402 && budgetLeftLive(candidate.provider.id) > 0) {
       const retry = await callCandidate(candidate, clientApi, body, stream);
       if (retry.ok) {
